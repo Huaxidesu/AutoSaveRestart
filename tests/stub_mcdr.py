@@ -39,6 +39,44 @@ class DummyLiteral(DummyNode):
     pass
 
 
+class DummyColorValue:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class DummyRColor:
+    red = DummyColorValue("red")
+    yellow = DummyColorValue("yellow")
+    gold = DummyColorValue("gold")
+    green = DummyColorValue("green")
+    aqua = DummyColorValue("aqua")
+    gray = DummyColorValue("gray")
+
+
+class DummyRStyle:
+    bold = "bold"
+
+
+class DummyRTextBase:
+    def __str__(self) -> str:
+        raise NotImplementedError
+
+
+class DummyRText(DummyRTextBase):
+    def __init__(
+        self,
+        text: Any,
+        color: Any = None,
+        styles: Any = None,
+    ) -> None:
+        self.text = str(text)
+        self.color = color
+        self.styles = styles
+
+    def __str__(self) -> str:
+        return self.text
+
+
 class DummyCommandSource:
     pass
 
@@ -55,6 +93,10 @@ def install_mcdr_stub() -> None:
     all_module.Integer = DummyInteger
     all_module.Literal = DummyLiteral
     all_module.PluginServerInterface = DummyPluginServerInterface
+    all_module.RColor = DummyRColor
+    all_module.RStyle = DummyRStyle
+    all_module.RText = DummyRText
+    all_module.RTextBase = DummyRTextBase
 
     sys.modules.setdefault("mcdreforged", mcdr_module)
     sys.modules.setdefault("mcdreforged.api", api_module)
@@ -70,6 +112,7 @@ class FakeServer:
         self.logger = logging.getLogger("autosave-test")
         self.running = True
         self.messages: List[str] = []
+        self.raw_messages: List[Any] = []
         self.commands: List[str] = []
         self.saved_configs: List[dict[str, Any]] = []
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -92,8 +135,9 @@ class FakeServer:
     def is_server_running(self) -> bool:
         return self.running
 
-    def say(self, message: str) -> None:
-        self.messages.append(message)
+    def say(self, message: Any) -> None:
+        self.raw_messages.append(message)
+        self.messages.append(str(message))
 
     def execute(self, command: str) -> None:
         self.commands.append(command)
@@ -149,9 +193,11 @@ class FakeSource:
         self.is_console = console
         self.is_player = player is not None
         self.replies: List[str] = []
+        self.raw_replies: List[Any] = []
 
     def has_permission(self, level: int) -> bool:
         return self.permission_level >= level
 
-    def reply(self, message: str) -> None:
-        self.replies.append(message)
+    def reply(self, message: Any) -> None:
+        self.raw_replies.append(message)
+        self.replies.append(str(message))

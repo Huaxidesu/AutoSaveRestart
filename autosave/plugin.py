@@ -6,13 +6,17 @@ import threading
 import time
 from concurrent.futures import Future
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Set, TypeVar
+from typing import Any, Callable, Dict, Optional, Set, TypeVar, Union
 
 from mcdreforged.api.all import (
     CommandSource,
     Integer,
     Literal,
     PluginServerInterface,
+    RColor,
+    RStyle,
+    RText,
+    RTextBase,
 )
 
 from .config import (
@@ -24,6 +28,7 @@ from .config import (
 
 
 T = TypeVar("T")
+MessagePayload = Union[str, RTextBase]
 
 
 class Phase(Enum):
@@ -109,7 +114,10 @@ class AutoSaveManager:
 
         self.server.register_help_message(
             self.config.command_root,
-            self.config.messages.help,
+            self._styled_text(
+                self.config.messages.help,
+                RColor.aqua,
+            ),
             permission=self.config.permission_level,
         )
 
@@ -133,9 +141,15 @@ class AutoSaveManager:
     def _has_permission(self, source: CommandSource) -> bool:
         return source.has_permission(self.config.permission_level)
 
-    def _permission_denied_message(self, source: CommandSource) -> str:
+    def _permission_denied_message(
+        self,
+        source: CommandSource,
+    ) -> MessagePayload:
         del source
-        return self.config.messages.permission_denied
+        return self._styled_text(
+            self.config.messages.permission_denied,
+            RColor.red,
+        )
 
     def _command_status(self, source: CommandSource) -> None:
         with self._lock:
@@ -147,49 +161,83 @@ class AutoSaveManager:
 
         phase_text = self._phase_text(phase)
         source.reply(
-            self._format_message(
-                self.config.messages.status_header,
-                phase=phase_text,
+            self._styled_text(
+                self._format_message(
+                    self.config.messages.status_header,
+                    phase=phase_text,
+                ),
+                RColor.aqua,
+                bold=True,
             )
         )
 
         if flow_active:
             remaining = self._remaining_text(current_flow_save_at)
             source.reply(
-                self._format_message(
-                    self.config.messages.status_current_flow,
-                    remaining=remaining,
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.status_current_flow,
+                        remaining=remaining,
+                    ),
+                    RColor.gold,
                 )
             )
-            source.reply(self.config.messages.status_next_after_flow)
+            source.reply(
+                self._styled_text(
+                    self.config.messages.status_next_after_flow,
+                    RColor.gray,
+                )
+            )
         else:
             source.reply(
-                self._format_message(
-                    self.config.messages.status_next,
-                    remaining=self._remaining_text(next_auto_save_at),
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.status_next,
+                        remaining=self._remaining_text(next_auto_save_at),
+                    ),
+                    RColor.yellow,
                 )
             )
 
         if phase is Phase.COUNTDOWN:
             source.reply(
-                self._format_message(
-                    self.config.messages.status_countdown,
-                    seconds=countdown_remaining,
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.status_countdown,
+                        seconds=countdown_remaining,
+                    ),
+                    RColor.red,
+                    bold=True,
                 )
             )
         else:
-            source.reply(self.config.messages.status_not_countdown)
+            source.reply(
+                self._styled_text(
+                    self.config.messages.status_not_countdown,
+                    RColor.gray,
+                )
+            )
 
     def _command_run(self, source: CommandSource) -> None:
         if not self.server.is_server_running():
-            source.reply(self.config.messages.manual_server_offline)
+            source.reply(
+                self._styled_text(
+                    self.config.messages.manual_server_offline,
+                    RColor.red,
+                )
+            )
             return
 
         with self._lock:
             if self._shutdown:
                 return
             if self._flow_active:
-                source.reply(self.config.messages.already_running)
+                source.reply(
+                    self._styled_text(
+                        self.config.messages.already_running,
+                        RColor.yellow,
+                    )
+                )
                 return
 
             old_future = self._cycle_future
@@ -213,7 +261,12 @@ class AutoSaveManager:
 
         if old_future is not None:
             old_future.cancel()
-        source.reply(self.config.messages.manual_started)
+        source.reply(
+            self._styled_text(
+                self.config.messages.manual_started,
+                RColor.aqua,
+            )
+        )
 
     def _command_cancel(self, source: CommandSource) -> None:
         with self._lock:
@@ -223,7 +276,12 @@ class AutoSaveManager:
                 or self._phase is not Phase.COUNTDOWN
                 or self._cycle_future is None
             ):
-                source.reply(self.config.messages.cancel_not_available)
+                source.reply(
+                    self._styled_text(
+                        self.config.messages.cancel_not_available,
+                        RColor.yellow,
+                    )
+                )
                 return
 
             actor = self._actor_name(source)
@@ -243,7 +301,12 @@ class AutoSaveManager:
                 ):
                     self._cancel_requested = False
                     self._cancel_reason = None
-            source.reply(self.config.messages.cancel_not_available)
+            source.reply(
+                self._styled_text(
+                    self.config.messages.cancel_not_available,
+                    RColor.yellow,
+                )
+            )
 
     def _command_set_interval(
         self,
@@ -255,7 +318,12 @@ class AutoSaveManager:
             minutes_value,
             bool,
         ):
-            source.reply(self.config.messages.config_save_failed)
+            source.reply(
+                self._styled_text(
+                    self.config.messages.config_save_failed,
+                    RColor.red,
+                )
+            )
             return
 
         minimum_minutes = max(
@@ -264,9 +332,12 @@ class AutoSaveManager:
         )
         if minutes_value < minimum_minutes:
             source.reply(
-                self._format_message(
-                    self.config.messages.interval_too_short,
-                    minimum_minutes=minimum_minutes,
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.interval_too_short,
+                        minimum_minutes=minimum_minutes,
+                    ),
+                    RColor.red,
                 )
             )
             return
@@ -282,7 +353,12 @@ class AutoSaveManager:
                 "Failed to save AutoSaveRestart config: %s",
                 error,
             )
-            source.reply(self.config.messages.config_save_failed)
+            source.reply(
+                self._styled_text(
+                    self.config.messages.config_save_failed,
+                    RColor.red,
+                )
+            )
             return
 
         with self._lock:
@@ -294,9 +370,12 @@ class AutoSaveManager:
                 self._reset_auto_cycle_locked()
 
         source.reply(
-            self._format_message(
-                self.config.messages.interval_updated,
-                minutes=minutes_value,
+            self._styled_text(
+                self._format_message(
+                    self.config.messages.interval_updated,
+                    minutes=minutes_value,
+                ),
+                RColor.green,
             )
         )
 
@@ -385,7 +464,10 @@ class AutoSaveManager:
                     seconds=config_snapshot.warning_seconds,
                 )
                 if not await self._broadcast_async(
-                    warning_message,
+                    self._styled_text(
+                        warning_message,
+                        RColor.gold,
+                    ),
                     generation,
                 ):
                     return
@@ -407,8 +489,15 @@ class AutoSaveManager:
                     config_snapshot.messages.countdown,
                     seconds=seconds,
                 )
+                countdown_color = (
+                    RColor.red if seconds <= 5 else RColor.yellow
+                )
                 if not await self._broadcast_async(
-                    countdown_message,
+                    self._styled_text(
+                        countdown_message,
+                        countdown_color,
+                        bold=seconds <= 5,
+                    ),
                     generation,
                 ):
                     return
@@ -418,7 +507,11 @@ class AutoSaveManager:
                 return
 
             if not await self._broadcast_async(
-                config_snapshot.messages.saving,
+                self._styled_text(
+                    config_snapshot.messages.saving,
+                    RColor.aqua,
+                    bold=True,
+                ),
                 generation,
             ):
                 return
@@ -430,7 +523,11 @@ class AutoSaveManager:
                 return
 
             await self._broadcast_async(
-                config_snapshot.messages.saved,
+                self._styled_text(
+                    config_snapshot.messages.saved,
+                    RColor.green,
+                    bold=True,
+                ),
                 generation,
             )
         except asyncio.CancelledError:
@@ -450,9 +547,13 @@ class AutoSaveManager:
         if reason is None:
             return
 
-        message = self._format_message(
-            self.config.messages.cancelled,
-            reason=reason,
+        message = self._styled_text(
+            self._format_message(
+                self.config.messages.cancelled,
+                reason=reason,
+            ),
+            RColor.red,
+            bold=True,
         )
         try:
             await self._run_on_executor(
@@ -515,14 +616,18 @@ class AutoSaveManager:
 
     async def _broadcast_async(
         self,
-        message: str,
+        message: MessagePayload,
         generation: int,
     ) -> bool:
         return await self._run_on_executor(
             lambda: self._broadcast_sync(message, generation)
         )
 
-    def _broadcast_sync(self, message: str, generation: int) -> bool:
+    def _broadcast_sync(
+        self,
+        message: MessagePayload,
+        generation: int,
+    ) -> bool:
         with self._lock:
             if not self._is_action_allowed_locked(generation):
                 return False
@@ -541,7 +646,7 @@ class AutoSaveManager:
 
     def _broadcast_cancellation_sync(
         self,
-        message: str,
+        message: MessagePayload,
         generation: int,
     ) -> bool:
         with self._lock:
@@ -658,6 +763,16 @@ class AutoSaveManager:
                 error,
             )
             return template
+
+    @staticmethod
+    def _styled_text(
+        text: str,
+        color: RColor,
+        *,
+        bold: bool = False,
+    ) -> RText:
+        styles = RStyle.bold if bold else None
+        return RText(text, color=color, styles=styles)
 
     @staticmethod
     def _actor_name(source: CommandSource) -> str:

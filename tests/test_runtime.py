@@ -3,7 +3,12 @@ from __future__ import annotations
 import time
 import unittest
 
-from stub_mcdr import FakeServer, FakeSource, install_mcdr_stub
+from stub_mcdr import (
+    DummyRStyle,
+    FakeServer,
+    FakeSource,
+    install_mcdr_stub,
+)
 
 install_mcdr_stub()
 
@@ -70,8 +75,48 @@ class RuntimeTests(unittest.TestCase):
             any("正在保存" in message for message in self.server.messages)
         )
         self.assertTrue(
-            any("已执行" in message for message in self.server.messages)
+            any("保存完成" in message for message in self.server.messages)
         )
+        manager.shutdown()
+
+    def test_player_messages_use_context_colors(self) -> None:
+        manager = self._make_manager(1, 1)
+        source = FakeSource(player="Admin", console=False)
+        manager._command_run(source)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not self.server.commands:
+            time.sleep(0.01)
+        time.sleep(0.05)
+
+        warning = next(
+            message
+            for message in self.server.raw_messages
+            if "短暂卡顿" in str(message)
+        )
+        countdown = next(
+            message
+            for message in self.server.raw_messages
+            if str(message) == "【自动保存】1 秒后保存地图。"
+        )
+        saving = next(
+            message
+            for message in self.server.raw_messages
+            if "正在保存地图" in str(message)
+        )
+        saved = next(
+            message
+            for message in self.server.raw_messages
+            if "地图保存完成" in str(message)
+        )
+
+        self.assertEqual(warning.color.name, "gold")
+        self.assertEqual(countdown.color.name, "red")
+        self.assertEqual(countdown.styles, DummyRStyle.bold)
+        self.assertEqual(saving.color.name, "aqua")
+        self.assertEqual(saving.styles, DummyRStyle.bold)
+        self.assertEqual(saved.color.name, "green")
+        self.assertEqual(saved.styles, DummyRStyle.bold)
         manager.shutdown()
 
     def test_set_interval_persists_and_resets_timer(self) -> None:
