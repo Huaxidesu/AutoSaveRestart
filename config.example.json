@@ -1,0 +1,40 @@
+{
+  "interval_minutes": 30,
+  "warning_seconds": 60,
+  "countdown_seconds": 10,
+  "save_command": "save-all flush",
+  "command_root": "!!autosave",
+  "command_aliases": [
+    "!!as"
+  ],
+  "permission_level": 3,
+  "messages": {
+    "help": "Minecraft 自动保存管理",
+    "warning": "[自动保存] 服务器将在 {seconds} 秒后保存地图，请注意可能出现短暂卡顿。",
+    "countdown": "[自动保存] 地图将在 {seconds} 秒后保存。",
+    "saving": "[自动保存] 正在保存服务器地图……",
+    "saved": "[自动保存] 地图保存命令已执行。",
+    "cancelled": "[自动保存] 本次保存已取消：{reason}",
+    "server_offline": "[自动保存] 游戏服务器未运行，本次保存已跳过。",
+    "status_header": "[自动保存] 当前状态：{phase}",
+    "status_next": "下一次自动保存：{remaining}",
+    "status_current_flow": "当前保存流程预计：{remaining} 后执行保存",
+    "status_countdown": "倒计时状态：是，剩余 {seconds} 秒",
+    "status_not_countdown": "倒计时状态：否",
+    "status_next_after_flow": "下一次自动保存：本次流程结束后重新计时",
+    "manual_started": "[自动保存] 已手动触发完整保存流程。",
+    "already_running": "[自动保存] 已有保存流程正在进行，未重复触发。",
+    "cancel_not_available": "[自动保存] 当前不在倒计时阶段，无法取消。",
+    "cancel_reason_admin": "管理员 {actor} 手动取消",
+    "interval_updated": "[自动保存] 自动保存间隔已修改为 {minutes} 分钟，并已重置定时器。",
+    "config_save_failed": "[自动保存] 配置写入失败，间隔未修改。",
+    "manual_server_offline": "[自动保存] 游戏服务器未运行，无法开始保存。",
+    "permission_denied": "[自动保存] 权限不足，仅管理员或控制台可使用。",
+    "interval_too_short": "[自动保存] 间隔至少需要 {minimum_minutes} 分钟，否则无法容纳当前的前置预警时间。",
+    "phase_waiting": "等待下一次自动保存",
+    "phase_warning": "已发送前置预警",
+    "phase_silent_wait": "预警后的静默等待",
+    "phase_countdown": "逐秒倒计时",
+    "phase_saving": "正在执行保存"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "autosave",
+  "version": "1.0.0",
+  "name": "AutoSaveRestart",
+  "description": "Non-blocking scheduled Minecraft map saving with warnings and cancellable countdowns",
+  "dependencies": {
+    "mcdreforged": ">=2.14.0"
+  }
+}
