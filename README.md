@@ -1,118 +1,253 @@
-# AutoSaveRestart for MCDReforged
+# AutoSaveRestart
 
-一个基于 MCDR 原生 `AsyncTaskExecutor` 的轻量自动保存插件。无第三方运行时依赖，不使用 `time.sleep`、APScheduler 或自行维护的阻塞定时线程。
+AutoSaveRestart 是一个适用于 **MCDReforged** 的 Minecraft GTNH 插件端服务器自动保存插件。
 
-## 兼容性
+插件可以按照设定的时间间隔自动保存服务器地图，并在保存前向全服发送预警和倒计时提示。
 
-- MCDReforged >= 2.14.0
-- Python 3.8+
-- Java 版 Minecraft 服务端；默认保存命令为 `save-all flush`
+管理员也可以随时查看保存状态、手动触发保存、取消本次保存，或者直接修改自动保存间隔。
+
+## 功能
+
+* 定时自动保存服务器地图
+* 保存前向全服发送预警
+* 最后几秒逐秒倒计时
+* 保存开始和完成时发送提示
+* 支持管理员手动触发保存
+* 支持倒计时期间取消本次保存
+* 支持直接修改自动保存间隔
+* 支持自定义保存命令
+* 支持自定义提示文本
+* 支持自定义命令名称和别名
+* 配置文件首次使用时自动生成
+
+## 使用要求
+
+* MCDReforged 2.14.0 或更高版本
+* Minecraft Java 版服务端
 
 ## 安装
 
-将打包后的 `AutoSaveRestart-v1.0.0.mcdr` 放进 MCDR 的 `plugins/` 目录，然后加载或重载插件：
-
-```text
-!!MCDR plugin load AutoSaveRestart-v1.0.0.mcdr
-```
-
-插件首次加载时会自动创建：
+1. 下载最新版 `AutoSaveRestart-v版本号.mcdr`
+2. 将文件放入 MCDReforged 的 `plugins` 文件夹
+3. 重启 MCDReforged，或者重新加载插件
+4. 插件首次启动后会自动生成配置文件：
 
 ```text
 config/autosave/config.json
 ```
 
-修改 `command_root`、`command_aliases`、权限或提示文本后，请重载插件使命令树重新注册。`!!autosave set <分钟>` 不需要重载，会立即写入配置并重置自动保存计时器。
+安装完成后，插件会按照默认设置自动运行。
 
-## 保存流程
+## 默认保存流程
 
-默认流程：
+默认情况下：
 
-1. 距离保存 60 秒时广播前置预警。
-2. 静默等待 50 秒。
-3. 最后 10 秒逐秒广播倒计时。
-4. 广播“正在保存”。
-5. 通过 MCDR TaskExecutor 执行 `save-all flush`。
-6. 广播保存命令已执行。
+1. 每 30 分钟自动保存一次
+2. 距离保存 60 秒时向全服发送预警
+3. 最后 10 秒开始逐秒倒计时
+4. 倒计时结束后提示正在保存
+5. 执行服务器地图保存
+6. 保存完成后发送提示
 
-`interval_minutes` 表示相邻自动保存执行时刻之间的间隔。因此配置中的 `warning_seconds` 不能长于整个自动保存间隔；非法配置会在加载时安全修正并写回。
+保存间隔、预警时间、倒计时时间和提示文字都可以修改。
 
 ## 管理命令
 
-默认要求 MCDR `admin`（权限等级 3）或更高权限。控制台始终拥有 owner 权限，因此可直接使用。
+默认情况下，以下命令仅管理员或控制台可以使用。
+
+### 查看插件状态
 
 ```text
 !!autosave
+```
+
+或者：
+
+```text
 !!as
 ```
 
-查看当前阶段、下一次自动保存剩余时间以及是否处于逐秒倒计时。
+可以查看：
+
+* 插件当前运行状态
+* 距离下一次自动保存还有多久
+* 当前是否正在进行保存流程
+* 当前是否处于倒计时阶段
+
+### 手动执行一次保存
 
 ```text
 !!autosave run
 ```
 
-立即开始一次完整的“预警 -> 静默等待 -> 逐秒倒计时 -> 保存”流程。如果已有保存流程正在执行，不会创建第二份任务。
+立即开始一次完整的保存流程：
+
+```text
+预警 → 等待 → 倒计时 → 保存
+```
+
+如果当前已经有保存流程正在进行，则不会重复开启第二次。
+
+### 取消本次保存
 
 ```text
 !!autosave cancel
 ```
 
-仅在逐秒倒计时阶段可用。它会取消当前协程，阻止剩余提示和保存命令，并广播“管理员手动取消”的原因。取消后重新从完整间隔开始安排下一次自动保存。
+在逐秒倒计时期间，可以取消当前这一次保存。
+
+取消后：
+
+* 本次倒计时停止
+* 本次保存不会执行
+* 全服会收到取消提示
+* 下一轮自动保存仍然会正常进行
+
+### 修改自动保存间隔
 
 ```text
 !!autosave set <分钟>
 ```
 
-修改自动保存间隔，立即写入 `config/autosave/config.json`。如果当前没有保存流程，会立刻取消旧定时任务并按新间隔重新计时；如果正处于保存流程，则当前流程继续，完成后按新间隔计时。
-
-## 默认配置
-
-完整示例见 `config.example.json`。首次加载时 MCDR 会自动生成等价的 `config/autosave/config.json`。
-
-```json
-{
-  "interval_minutes": 30,
-  "warning_seconds": 60,
-  "countdown_seconds": 10,
-  "save_command": "save-all flush",
-  "command_root": "!!autosave",
-  "command_aliases": ["!!as"],
-  "permission_level": 3,
-  "messages": {
-    "warning": "[自动保存] 服务器将在 {seconds} 秒后保存地图，请注意可能出现短暂卡顿。",
-    "countdown": "[自动保存] 地图将在 {seconds} 秒后保存。",
-    "saving": "[自动保存] 正在保存服务器地图……",
-    "saved": "[自动保存] 地图保存命令已执行。",
-    "cancelled": "[自动保存] 本次保存已取消：{reason}"
-  }
-}
-```
-
-`messages` 中还有帮助文本、状态查询、权限、配置错误和阶段名称等文本；不要只复制上面的缩略片段覆盖原文件。直接编辑插件自动生成的完整文件即可。
-
-## 异步与热重载安全
-
-插件内部只有一个“周期任务”引用。自动等待、预警、静默等待和倒计时都运行在 MCDR 原生异步执行器中的协程里，延迟使用 `asyncio.sleep()`，不会阻塞 MCDR TaskExecutor。
-
-每次重置计时器都会增加任务 generation。旧任务即使在取消信号和实际退出之间发生极短竞态，也会因为 generation 不再匹配而拒绝广播和执行保存命令。
-
-所有 `server.say()` 与 `server.execute()` 都再次投递到 MCDR TaskExecutor，并在真正执行前检查：
-
-- 插件尚未卸载；
-- 任务 generation 仍有效；
-- Minecraft 服务端仍在运行。
-
-`on_unload` 会先把插件标记为 shutdown 并废弃当前 generation，然后取消主周期 Future 和所有仍在等待的 TaskExecutor Future。因此热重载不会遗留下一轮倒计时或“幽灵 save-all”。
-
-## 源码结构
+例如：
 
 ```text
-autosave/
-├── __init__.py       # MCDR 生命周期入口
-├── config.py         # 默认配置、递归回退、类型/边界校验
-└── plugin.py         # 命令、状态机、异步周期与生命周期管理
-mcdreforged.plugin.json
-config.example.json
-tests/
+!!autosave set 60
 ```
+
+表示将自动保存间隔修改为：
+
+```text
+60 分钟
+```
+
+修改成功后会自动保存到配置文件。
+
+## 常用示例
+
+每 30 分钟保存一次：
+
+```text
+!!autosave set 30
+```
+
+每 1 小时保存一次：
+
+```text
+!!autosave set 60
+```
+
+立即执行一次保存：
+
+```text
+!!autosave run
+```
+
+查看下一次保存时间：
+
+```text
+!!autosave
+```
+
+取消当前倒计时：
+
+```text
+!!autosave cancel
+```
+
+## 配置文件
+
+配置文件位置：
+
+```text
+config/autosave/config.json
+```
+
+常用配置：
+
+| 配置项 | 作用 | 默认值 |
+| ------------------- | ------------- | ---------------- |
+| `interval_minutes` | 自动保存间隔，单位为分钟 | `30` |
+| `warning_seconds` | 提前多少秒发送预警 | `60` |
+| `countdown_seconds` | 最后多少秒开始逐秒倒计时 | `10` |
+| `save_command` | 保存地图时执行的服务器命令 | `save-all flush` |
+| `command_root` | 插件主命令 | `!!autosave` |
+| `command_aliases` | 插件命令别名 | `!!as` |
+| `permission_level` | 管理命令所需权限等级 | `3` |
+| `messages` | 插件显示的各种提示文字 | 可自定义 |
+
+如果只是修改自动保存间隔，推荐直接使用：
+
+```text
+!!autosave set <分钟>
+```
+
+如果需要修改预警时间、倒计时、保存命令或提示文字，则编辑：
+
+```text
+config/autosave/config.json
+```
+
+然后重新加载插件。
+
+仓库中也提供了一份完整配置示例：
+
+```text
+config.example.json
+```
+
+## 保存命令
+
+默认保存命令：
+
+```text
+save-all flush
+```
+
+如果你的服务器不适合使用该命令，可以在配置文件中修改：
+
+```text
+save_command
+```
+
+例如：
+
+```text
+save-all
+```
+
+具体使用哪个保存命令，请根据自己的 Minecraft 服务端进行选择。
+
+## 权限
+
+默认管理命令权限等级：
+
+```text
+3
+```
+
+也就是 MCDReforged 管理员权限。
+
+服务器控制台可以直接使用插件的所有管理命令。
+
+如果需要修改权限要求，可以修改配置文件中的：
+
+```text
+permission_level
+```
+
+## 更新插件
+
+下载新版 `.mcdr` 文件后，替换 `plugins` 文件夹中的旧版本，然后重新加载插件即可。
+
+建议更新前保留自己的配置文件：
+
+```text
+config/autosave/config.json
+```
+
+这样可以继续使用原来的保存间隔和自定义提示。
+
+## AutoSaveRestart
+
+一个简单、方便的 MCDReforged Minecraft 服务器自动保存插件。
