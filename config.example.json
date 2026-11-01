@@ -2,7 +2,8 @@
   "interval_minutes": 30,
   "warning_seconds": 60,
   "countdown_seconds": 10,
-  "save_command": "save-all flush",
+  "save_command": "save-all",
+  "broadcast_mode": "say",
   "command_root": "!!autosave",
   "command_aliases": [
     "!!as"

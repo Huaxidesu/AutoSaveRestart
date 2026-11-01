@@ -63,6 +63,43 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(config.command_aliases, ("!!as",))
 
+    def test_default_save_command_has_no_flush(self) -> None:
+        config, _ = parse_config(dict(DEFAULT_CONFIG))
+
+        self.assertEqual(config.save_command, "save-all")
+
+    def test_legacy_flush_save_command_is_downgraded(self) -> None:
+        config, changed = parse_config({"save_command": "save-all flush"})
+
+        self.assertTrue(changed)
+        self.assertEqual(config.save_command, "save-all")
+
+    def test_save_command_newlines_are_flattened(self) -> None:
+        config, changed = parse_config({"save_command": "save-all\r\n"})
+
+        self.assertTrue(changed)
+        self.assertEqual(config.save_command, "save-all")
+
+    def test_broadcast_mode_defaults_to_say(self) -> None:
+        config, changed = parse_config({})
+
+        self.assertTrue(changed)
+        self.assertEqual(config.broadcast_mode, "say")
+        self.assertFalse(config.use_tellraw)
+
+    def test_unknown_broadcast_mode_falls_back(self) -> None:
+        config, changed = parse_config({"broadcast_mode": "json"})
+
+        self.assertTrue(changed)
+        self.assertEqual(config.broadcast_mode, "say")
+
+    def test_broadcast_mode_is_case_insensitive(self) -> None:
+        config, changed = parse_config({"broadcast_mode": " Tellraw "})
+
+        self.assertTrue(changed)
+        self.assertEqual(config.broadcast_mode, "tellraw")
+        self.assertTrue(config.use_tellraw)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import math
 import threading
 import time
 from concurrent.futures import Future
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Set, TypeVar, Union
 
@@ -29,6 +30,42 @@ from .config import (
 
 T = TypeVar("T")
 MessagePayload = Union[str, RTextBase]
+
+# 1.7.10 仅支持 § 颜色码，不支持 RGB / hex，此表将 RColor 映射为对应的 § 码。
+# 以 RColor 的 name 作为键，兼容 RColor 不是 Enum 的 MCDR 版本。
+LEGACY_COLOR_CODES: Dict[str, str] = {
+    "black": "0",
+    "dark_blue": "1",
+    "dark_green": "2",
+    "dark_aqua": "3",
+    "dark_red": "4",
+    "dark_purple": "5",
+    "gold": "6",
+    "gray": "7",
+    "dark_gray": "8",
+    "blue": "9",
+    "green": "a",
+    "aqua": "b",
+    "red": "c",
+    "light_purple": "d",
+    "yellow": "e",
+    "white": "f",
+}
+
+
+@dataclass(frozen=True)
+class Broadcast:
+    """
+    一条发往全服的提示。
+
+    统一保存文本、颜色与加粗状态，发送时按 broadcast_mode 渲染：
+    say 模式拼接 § 码后执行原生 say 指令（1.7.10 / GTNH 兼容性最佳），
+    tellraw 模式还原为 RText 交给 server.say()。
+    """
+
+    text: str
+    color: Any = None
+    bold: bool = False
 
 
 class Phase(Enum):
@@ -69,10 +106,12 @@ class AutoSaveManager:
             self._schedule_auto_cycle_locked()
         self.server.logger.info(
             "AutoSaveRestart loaded: interval=%d min, warning=%d s, "
-            "countdown=%d s",
+            "countdown=%d s, broadcast=%s, save_command=%r",
             self.config.interval_minutes,
             self.config.warning_seconds,
             self.config.countdown_seconds,
+            self.config.broadcast_mode,
+            self.config.save_command,
         )
 
     def shutdown(self) -> None:
@@ -464,10 +503,7 @@ class AutoSaveManager:
                     seconds=config_snapshot.warning_seconds,
                 )
                 if not await self._broadcast_async(
-                    self._styled_text(
-                        warning_message,
-                        RColor.gold,
-                    ),
+                    Broadcast(warning_message, RColor.gold),
                     generation,
                 ):
                     return
@@ -493,7 +529,7 @@ class AutoSaveManager:
                     RColor.red if seconds <= 5 else RColor.yellow
                 )
                 if not await self._broadcast_async(
-                    self._styled_text(
+                    Broadcast(
                         countdown_message,
                         countdown_color,
                         bold=seconds <= 5,
@@ -507,7 +543,7 @@ class AutoSaveManager:
                 return
 
             if not await self._broadcast_async(
-                self._styled_text(
+                Broadcast(
                     config_snapshot.messages.saving,
                     RColor.aqua,
                     bold=True,
@@ -523,7 +559,7 @@ class AutoSaveManager:
                 return
 
             await self._broadcast_async(
-                self._styled_text(
+                Broadcast(
                     config_snapshot.messages.saved,
                     RColor.green,
                     bold=True,
@@ -547,7 +583,7 @@ class AutoSaveManager:
         if reason is None:
             return
 
-        message = self._styled_text(
+        message = Broadcast(
             self._format_message(
                 self.config.messages.cancelled,
                 reason=reason,
@@ -556,12 +592,7 @@ class AutoSaveManager:
             bold=True,
         )
         try:
-            await self._run_on_executor(
-                lambda: self._broadcast_cancellation_sync(
-                    message,
-                    generation,
-                )
-            )
+            await self._broadcast_cancellation_async(message, generation)
         except asyncio.CancelledError:
             return
 
@@ -616,26 +647,45 @@ class AutoSaveManager:
 
     async def _broadcast_async(
         self,
-        message: MessagePayload,
+        message: Broadcast,
         generation: int,
     ) -> bool:
         return await self._run_on_executor(
             lambda: self._broadcast_sync(message, generation)
         )
 
-    def _broadcast_sync(
+    async def _broadcast_cancellation_async(
         self,
-        message: MessagePayload,
+        message: Broadcast,
         generation: int,
     ) -> bool:
+        return await self._run_on_executor(
+            lambda: self._broadcast_sync(
+                message,
+                generation,
+                allow_cancelled=True,
+            )
+        )
+
+    def _broadcast_sync(
+        self,
+        message: Broadcast,
+        generation: int,
+        *,
+        allow_cancelled: bool = False,
+    ) -> bool:
         with self._lock:
-            if not self._is_action_allowed_locked(generation):
-                return False
+            if allow_cancelled:
+                allowed = self._is_generation_valid_locked(generation)
+            else:
+                allowed = self._is_action_allowed_locked(generation)
+        if not allowed:
+            return False
         if not self.server.is_server_running():
             return False
 
         try:
-            self.server.say(message)
+            self._deliver(message)
         except (OSError, UnicodeError) as error:
             self.server.logger.error(
                 "Failed to broadcast AutoSaveRestart message: %s",
@@ -644,26 +694,51 @@ class AutoSaveManager:
             return False
         return True
 
-    def _broadcast_cancellation_sync(
-        self,
-        message: MessagePayload,
-        generation: int,
-    ) -> bool:
-        with self._lock:
-            if not self._is_generation_valid_locked(generation):
-                return False
-        if not self.server.is_server_running():
-            return False
+    def _deliver(self, message: Broadcast) -> None:
+        """
+        按 broadcast_mode 发送一条 Broadcast。
 
-        try:
-            self.server.say(message)
-        except (OSError, UnicodeError) as error:
-            self.server.logger.error(
-                "Failed to broadcast AutoSaveRestart cancellation: %s",
-                error,
+        默认 say 模式执行原生 ``say`` 指令并使用 ``§`` 颜色码，兼容 1.7.10 / Thermos，
+        不依赖 tellraw 的 JSON，也不受 GTNH 聊天格式化模组影响。
+        tellraw 模式保留 RText 富文本，适用于较新版本的服务端。
+        """
+        body = self._sanitize_text(message.text)
+        if not body:
+            return
+
+        if self.config.use_tellraw:
+            self.server.say(
+                RText(
+                    body,
+                    color=message.color,
+                    styles=RStyle.bold if message.bold else None,
+                )
             )
-            return False
-        return True
+            return
+
+        prefix = self._color_code(message.color)
+        if message.bold:
+            prefix += "\u00a7l"
+        self.server.execute("say {}{}\u00a7r".format(prefix, body))
+
+    @staticmethod
+    def _color_code(color: Any) -> str:
+        """
+        获取颜色对应的 § 码。
+
+        MCDR 的 RColor 自带 ``mc_code``（如 ``§6``），优先使用；取不到时按 name 查表
+        （单元测试的桩对象属于此情况）。长度不为 2 的码（如 hex 长码）在 1.7.10 上
+        无法渲染，返回空串。
+        """
+        mc_code = getattr(color, "mc_code", None)
+        if isinstance(mc_code, str) and len(mc_code) == 2:
+            return mc_code
+
+        code = LEGACY_COLOR_CODES.get(
+            str(getattr(color, "name", "")),
+            "",
+        )
+        return "\u00a7" + code if code else ""
 
     async def _execute_save_async(
         self,
@@ -679,6 +754,10 @@ class AutoSaveManager:
             if not self._is_action_allowed_locked(generation):
                 return False
         if not self.server.is_server_running():
+            return False
+
+        command = self._sanitize_text(command)
+        if not command:
             return False
 
         try:
@@ -763,6 +842,16 @@ class AutoSaveManager:
                 error,
             )
             return template
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        """
+        控制台按行读取指令，提示文本中的换行会把一条 ``say`` 拆成两条命令，
+        因此统一压缩为单行并去除首尾空白。
+        """
+        return " ".join(
+            str(text).replace("\r", " ").replace("\n", " ").split()
+        )
 
     @staticmethod
     def _styled_text(

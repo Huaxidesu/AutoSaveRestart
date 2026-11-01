@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
@@ -9,11 +10,21 @@ CONFIG_FILE_NAME = "config.json"
 MIN_PERMISSION_LEVEL = 3
 MAX_PERMISSION_LEVEL = 4
 
+# 1.7.10 的 /save-all 没有 flush 参数（该参数自 1.13 起提供），默认值使用 save-all
+DEFAULT_SAVE_COMMAND = "save-all"
+
+# 全服提示的发送方式：
+#   say     —— 执行原生 say 指令，颜色用 § 码（1.7.10 / GTNH 推荐）
+#   tellraw —— 走 MCDR 的 server.say()，即 tellraw @a，支持 RText 富文本
+BROADCAST_MODES = ("say", "tellraw")
+DEFAULT_BROADCAST_MODE = "say"
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_minutes": 30,
     "warning_seconds": 60,
     "countdown_seconds": 10,
-    "save_command": "save-all flush",
+    "save_command": DEFAULT_SAVE_COMMAND,
+    "broadcast_mode": DEFAULT_BROADCAST_MODE,
     "command_root": "!!autosave",
     "command_aliases": ["!!as"],
     "permission_level": 3,
@@ -126,6 +137,7 @@ class AutoSaveConfig:
     warning_seconds: int
     countdown_seconds: int
     save_command: str
+    broadcast_mode: str
     command_root: str
     command_aliases: Tuple[str, ...]
     permission_level: int
@@ -139,12 +151,17 @@ class AutoSaveConfig:
     def silent_wait_seconds(self) -> int:
         return self.warning_seconds - self.countdown_seconds
 
+    @property
+    def use_tellraw(self) -> bool:
+        return self.broadcast_mode == "tellraw"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "interval_minutes": self.interval_minutes,
             "warning_seconds": self.warning_seconds,
             "countdown_seconds": self.countdown_seconds,
             "save_command": self.save_command,
+            "broadcast_mode": self.broadcast_mode,
             "command_root": self.command_root,
             "command_aliases": list(self.command_aliases),
             "permission_level": self.permission_level,
@@ -157,6 +174,7 @@ class AutoSaveConfig:
             warning_seconds=self.warning_seconds,
             countdown_seconds=self.countdown_seconds,
             save_command=self.save_command,
+            broadcast_mode=self.broadcast_mode,
             command_root=self.command_root,
             command_aliases=self.command_aliases,
             permission_level=self.permission_level,
@@ -233,8 +251,14 @@ def parse_config(raw: Mapping[str, Any]) -> Tuple[AutoSaveConfig, bool]:
     save_command, value_changed = _read_nonempty_string(
         working,
         "save_command",
-        str(DEFAULT_CONFIG["save_command"]),
+        DEFAULT_SAVE_COMMAND,
     )
+    save_command, command_changed = _normalize_save_command(save_command)
+    if command_changed:
+        working["save_command"] = save_command
+    changed = changed or value_changed or command_changed
+
+    broadcast_mode, value_changed = _read_broadcast_mode(working)
     changed = changed or value_changed
 
     command_root, value_changed = _read_command_literal(
@@ -285,6 +309,7 @@ def parse_config(raw: Mapping[str, Any]) -> Tuple[AutoSaveConfig, bool]:
         warning_seconds=warning_seconds,
         countdown_seconds=countdown_seconds,
         save_command=save_command,
+        broadcast_mode=broadcast_mode,
         command_root=command_root,
         command_aliases=tuple(command_aliases),
         permission_level=permission_level,
@@ -348,6 +373,42 @@ def _read_command_literal(
         data[key] = default
         return default, True
     return value, changed
+
+
+_LEGACY_FLUSH_PATTERN = re.compile(r"^save-?all\s+flush$", re.IGNORECASE)
+
+
+def _normalize_save_command(command: str) -> Tuple[str, bool]:
+    """
+    1.7.10 的 /save-all 没有 flush 参数（该参数自 1.13 起提供），旧配置中的
+    "save-all flush" 在此自动降级为 "save-all"，避免 Thermos 解析失败；
+    同时将换行替换为空格，防止一条命令被拆成两行发送。
+    """
+    normalized = command.replace("\r", " ").replace("\n", " ").strip()
+    changed = normalized != command
+    if _LEGACY_FLUSH_PATTERN.match(normalized):
+        normalized = "save-all"
+        changed = True
+    return normalized, changed
+
+
+def _read_broadcast_mode(
+    data: MutableMapping[str, Any],
+) -> Tuple[str, bool]:
+    value = data.get("broadcast_mode")
+    if not isinstance(value, str):
+        data["broadcast_mode"] = DEFAULT_BROADCAST_MODE
+        return DEFAULT_BROADCAST_MODE, True
+
+    mode = value.strip().lower()
+    if mode not in BROADCAST_MODES:
+        data["broadcast_mode"] = DEFAULT_BROADCAST_MODE
+        return DEFAULT_BROADCAST_MODE, True
+
+    if mode != value:
+        data["broadcast_mode"] = mode
+        return mode, True
+    return mode, False
 
 
 def _read_aliases(
