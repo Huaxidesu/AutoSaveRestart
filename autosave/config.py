@@ -15,7 +15,7 @@ DEFAULT_SAVE_COMMAND = "save-all"
 
 # 全服提示的发送方式：
 #   say     —— 执行原生 say 指令，颜色用 § 码（1.7.10 / GTNH 推荐）
-#   tellraw —— 走 MCDR 的 server.say()，即 tellraw @a，支持 RText 富文本
+#   tellraw —— 使用 MCDR 的 server.say()，即 tellraw @a，支持 RText 富文本
 BROADCAST_MODES = ("say", "tellraw")
 DEFAULT_BROADCAST_MODE = "say"
 

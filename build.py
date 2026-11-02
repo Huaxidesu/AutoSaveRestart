@@ -7,7 +7,7 @@
     python build.py            # 输出 dist/AutoSaveRestart-v<版本>.mcdr
     python build.py --check    # 只校验现有 dist 里的包，不重新打包
 
-.mcdr 就是 zip：根目录放 mcdreforged.plugin.json，其余文件按包名目录放。
+.mcdr 格式即 zip 包：根目录放 mcdreforged.plugin.json，其余文件按包名目录存放。
 """
 from __future__ import annotations
 
