@@ -17,6 +17,34 @@ from autosave.plugin import AutoSaveManager, Phase  # noqa: E402
 SAY_PREFIX = "say "
 
 
+class _NoPropagateFuture:
+    """
+    cancel() 不传导到真实任务，模拟 MCDR TaskDoneFuture 的行为：
+    卸载时取消 future 不会停止正在运行的 asyncio 协程。
+    """
+
+    def __init__(self, future) -> None:
+        self._future = future
+
+    def cancel(self) -> bool:
+        return False
+
+    def cancelled(self) -> bool:
+        return self._future.cancelled()
+
+    def done(self) -> bool:
+        return self._future.done()
+
+    def add_done_callback(self, callback) -> None:
+        self._future.add_done_callback(lambda _future: callback(self))
+
+    def result(self, timeout=None):
+        return self._future.result(timeout)
+
+    def exception(self, timeout=None):
+        return self._future.exception(timeout)
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = FakeServer()
@@ -202,6 +230,34 @@ class RuntimeTests(unittest.TestCase):
         time.sleep(0.3)
 
         self.assertEqual(self._save_commands(), [])
+
+    def test_shutdown_interrupts_pending_cycle_wait_quickly(self) -> None:
+        """
+        回归：MCDR 的 TaskDoneFuture.cancel() 不会传导到 asyncio 任务。
+        插件卸载后，正在等待下次自动保存的周期协程必须自行快速退出，
+        否则会拖住 MCDR 的 AsyncTaskExecutor 排空流程，使 MCDR
+        长时间停在「正在关闭 MCDR」，watchdog 持续打印卡住线程堆栈。
+        """
+        original_schedule = self.server.schedule_task
+        self.server.schedule_task = (
+            lambda callback: _NoPropagateFuture(original_schedule(callback))
+        )
+        # 间隔 2 分钟、预警 60 秒：周期协程将进入约 60 秒的预警等待睡眠
+        manager = self._make_manager(60, 10, interval_minutes=2)
+        time.sleep(0.3)
+
+        start = time.monotonic()
+        manager.shutdown()
+        deadline = time.monotonic() + 5
+        with manager._lock:
+            cycle_future = manager._cycle_future
+        while cycle_future is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+            with manager._lock:
+                cycle_future = manager._cycle_future
+
+        self.assertIsNone(cycle_future)
+        self.assertLess(time.monotonic() - start, 4)
 
 
 if __name__ == "__main__":

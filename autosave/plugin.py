@@ -31,6 +31,16 @@ from .config import (
 T = TypeVar("T")
 MessagePayload = Union[str, RTextBase]
 
+# 插件卸载后，挂起的周期协程须在该间隔内自行退出。
+# MCDR 的 TaskDoneFuture.cancel() 不会传导到 asyncio 任务，长睡眠协程
+# （预警等待最长可达 interval_minutes 分钟）会拖住 MCDR 的 AsyncTaskExecutor
+# 排空流程，导致 MCDR 在「正在关闭 MCDR」处长时间无响应，因此统一采用
+# 分段睡眠并在每段结束时检查卸载状态。
+SHUTDOWN_POLL_INTERVAL_SECONDS = 1.0
+
+# 桥接同步任务执行器的等待上限，防止 MCDR 停机竞态下 future 永不完成。
+EXECUTOR_WAIT_TIMEOUT_SECONDS = 15.0
+
 # 1.7.10 仅支持 § 颜色码，不支持 RGB / hex，此表将 RColor 映射为对应的 § 码。
 # 以 RColor 的 name 作为键，兼容 RColor 不是 Enum 的 MCDR 版本。
 LEGACY_COLOR_CODES: Dict[str, str] = {
@@ -464,8 +474,10 @@ class AutoSaveManager:
         prewarning_delay: int,
     ) -> None:
         try:
-            if prewarning_delay > 0:
-                await asyncio.sleep(prewarning_delay)
+            if prewarning_delay > 0 and not await self._interruptible_sleep(
+                prewarning_delay,
+            ):
+                return
         except asyncio.CancelledError:
             return
 
@@ -511,7 +523,8 @@ class AutoSaveManager:
             silent_wait = config_snapshot.silent_wait_seconds
             if silent_wait > 0:
                 self._set_phase(generation, Phase.SILENT_WAIT)
-                await asyncio.sleep(silent_wait)
+                if not await self._interruptible_sleep(silent_wait):
+                    return
 
             for seconds in range(
                 config_snapshot.countdown_seconds,
@@ -633,6 +646,22 @@ class AutoSaveManager:
             self._is_generation_valid_locked(generation)
             and not self._cancel_requested
         )
+
+    async def _interruptible_sleep(self, seconds: int) -> bool:
+        """
+        分段睡眠，每段结束时检查插件是否已进入卸载流程。
+
+        返回 False 表示因 shutdown 提前结束，调用方应直接返回，
+        避免挂起的协程拖住 MCDR 的 AsyncTaskExecutor 排空流程。
+        """
+        remaining = float(seconds)
+        while remaining > 0:
+            if self._shutdown:
+                return False
+            step = min(SHUTDOWN_POLL_INTERVAL_SECONDS, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
+        return not self._shutdown
 
     async def _server_running_async(self, generation: int) -> bool:
         return await self._run_on_executor(
@@ -779,7 +808,12 @@ class AutoSaveManager:
             else:
                 self._executor_futures.add(future)
         future.add_done_callback(self._on_executor_done)
-        return await asyncio.wrap_future(future)
+        # MCDR 停机时同步执行器可能已不再消费任务，future 会永远悬空；
+        # 限时等待保证本协程一定能够结束，不阻塞 AsyncTaskExecutor 排空。
+        return await asyncio.wait_for(
+            asyncio.wrap_future(future),
+            timeout=EXECUTOR_WAIT_TIMEOUT_SECONDS,
+        )
 
     def _on_executor_done(self, future: Future[Any]) -> None:
         with self._lock:
