@@ -53,16 +53,20 @@ DEFAULT_MESSAGES: Dict[str, str] = {
     "正在保存": "【自动保存】正在保存地图，请稍候……",
     "保存完成": "【自动保存】地图保存完成。",
     "保存已取消": "【自动保存】本次保存已取消：{reason}",
+    "重启已取消": "【手动重启】本次重启已取消：{reason}",
+    "关服已取消": "【手动关服】本次关服已取消：{reason}",
     "服务器未运行": "【自动保存】服务器当前未运行，本次保存已跳过。",
     "状态标题": "【自动保存】当前状态：{phase}",
     "下次保存": "下一次自动保存：{remaining}",
     "当前流程": "当前流程预计：{remaining} 后执行",
+    "预约状态": "已预约{action}：{remaining} 后{action}",
     "倒计时状态": "倒计时状态：是，剩余 {seconds} 秒",
     "非倒计时": "倒计时状态：否",
     "流程结束后": "下一次自动保存：本次流程结束后重新计时",
     "手动保存开始": "【自动保存】已开始手动保存流程。",
     "流程进行中": "【自动保存】已有流程正在进行，请稍候。",
     "无法取消": "【自动保存】当前没有可取消的流程。",
+    "取消已受理": "【自动保存】已取消本次操作。",
     "取消原因": "{actor} 已取消本次操作",
     "间隔已更新": (
         "【自动保存】自动保存间隔已设为 {minutes} 分钟，"
@@ -81,6 +85,7 @@ DEFAULT_MESSAGES: Dict[str, str] = {
     "阶段倒计时": "逐秒倒计时",
     "阶段保存": "正在执行保存",
     "阶段重启": "正在执行重启",
+    "阶段预约": "已预约，等待时间到达",
     "重启预警": (
         "【自动重启】服务器将在 {seconds} 秒后重启，"
         "请提前离开危险区域并结束正在进行的操作。"
@@ -89,6 +94,15 @@ DEFAULT_MESSAGES: Dict[str, str] = {
     "正在重启": "【自动重启】正在保存并重启服务器，请稍候……",
     "重启指令已发送": "【自动重启】重启指令已发送，服务器将自动拉起。",
     "手动重启开始": "【自动重启】已开始手动重启流程。",
+    "预约播报": (
+        "【手动{action}】{actor} 发起了{action}，"
+        "服务器将在 {remaining} 后{action}，请及时保存工作状态。"
+    ),
+    "预约提醒": "【手动{action}】距离{action}还有 {remaining}，请尽快保存工作状态。",
+    "预约已生效": (
+        "【手动{action}】已预约，将在 {remaining} 后{action}；"
+        "等待期间按剩余时间折半播报提醒。"
+    ),
     "已打断重启": "【自动重启】已打断本次自动重启：{reason}",
     "无可打断": "【自动重启】当前没有待执行的重启。",
     "打断原因": "{actor} 打断了本次重启",
@@ -104,6 +118,14 @@ DEFAULT_MESSAGES: Dict[str, str] = {
         "自动拉起已暂停。检查日志后执行 !!autosave guard on 恢复。"
     ),
     "守护已恢复": "【自动重启】崩溃计数已清零，崩溃守护已恢复。",
+    "手动关服开始": "【手动关服】已开始手动关服流程。",
+    "关服预警": (
+        "【手动关服】服务器将在 {seconds} 秒后关闭，"
+        "请提前离开危险区域并结束正在进行的操作。"
+    ),
+    "关服倒计时": "【手动关服】{seconds} 秒后关闭。",
+    "正在关服": "【手动关服】正在保存并关闭服务器，请稍候……",
+    "关服指令已发送": "【手动关服】服务器即将关闭，本次关服后不会自动拉起。",
     "关服完成": "【自动重启】崩溃守护已关闭，正在停止服务器，停止后不会自动拉起。",
     "启动请求已发送": "【自动重启】已请求启动服务端进程。",
     "启动失败": "【自动重启】服务端进程启动失败，请检查启动指令与端口占用情况。",
@@ -146,16 +168,20 @@ MESSAGE_KEYS: Dict[str, str] = {
     "saving": "正在保存",
     "saved": "保存完成",
     "cancelled": "保存已取消",
+    "restart_cancelled": "重启已取消",
+    "shutdown_cancelled": "关服已取消",
     "server_offline": "服务器未运行",
     "status_header": "状态标题",
     "status_next": "下次保存",
     "status_current_flow": "当前流程",
+    "status_scheduled": "预约状态",
     "status_countdown": "倒计时状态",
     "status_not_countdown": "非倒计时",
     "status_next_after_flow": "流程结束后",
     "manual_started": "手动保存开始",
     "already_running": "流程进行中",
     "cancel_not_available": "无法取消",
+    "cancel_confirmed": "取消已受理",
     "cancel_reason_admin": "取消原因",
     "interval_updated": "间隔已更新",
     "config_save_failed": "配置保存失败",
@@ -168,11 +194,20 @@ MESSAGE_KEYS: Dict[str, str] = {
     "phase_countdown": "阶段倒计时",
     "phase_saving": "阶段保存",
     "phase_restarting": "阶段重启",
+    "phase_scheduled": "阶段预约",
     "restart_warning": "重启预警",
     "restart_countdown": "重启倒计时",
     "restarting": "正在重启",
     "restart_dispatched": "重启指令已发送",
     "manual_restart_started": "手动重启开始",
+    "schedule_announce": "预约播报",
+    "schedule_tick": "预约提醒",
+    "schedule_confirmed": "预约已生效",
+    "manual_shutdown_started": "手动关服开始",
+    "shutdown_warning": "关服预警",
+    "shutdown_countdown": "关服倒计时",
+    "shutting_down": "正在关服",
+    "shutdown_dispatched": "关服指令已发送",
     "interrupt_done": "已打断重启",
     "interrupt_none": "无可打断",
     "interrupt_reason_admin": "打断原因",
@@ -218,16 +253,20 @@ class MessageConfig:
     saving: str
     saved: str
     cancelled: str
+    restart_cancelled: str
+    shutdown_cancelled: str
     server_offline: str
     status_header: str
     status_next: str
     status_current_flow: str
+    status_scheduled: str
     status_countdown: str
     status_not_countdown: str
     status_next_after_flow: str
     manual_started: str
     already_running: str
     cancel_not_available: str
+    cancel_confirmed: str
     cancel_reason_admin: str
     interval_updated: str
     config_save_failed: str
@@ -240,11 +279,20 @@ class MessageConfig:
     phase_countdown: str
     phase_saving: str
     phase_restarting: str
+    phase_scheduled: str
     restart_warning: str
     restart_countdown: str
     restarting: str
     restart_dispatched: str
     manual_restart_started: str
+    schedule_announce: str
+    schedule_tick: str
+    schedule_confirmed: str
+    manual_shutdown_started: str
+    shutdown_warning: str
+    shutdown_countdown: str
+    shutting_down: str
+    shutdown_dispatched: str
     interrupt_done: str
     interrupt_none: str
     interrupt_reason_admin: str

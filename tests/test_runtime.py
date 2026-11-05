@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
 from stub_mcdr import (
     FakeServer,
@@ -11,7 +12,11 @@ from stub_mcdr import (
 
 install_mcdr_stub()
 
-from autosave.config import default_config_dict, parse_config  # noqa: E402
+from autosave.config import (  # noqa: E402
+    AutoSaveConfig,
+    default_config_dict,
+    parse_config,
+)
 from autosave.plugin import (  # noqa: E402
     AutoSaveManager,
     FlowKind,
@@ -148,6 +153,38 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self._save_commands(), [])
         self.assertTrue(
             any("已取消" in text for text in self._broadcasts())
+        )
+        manager.shutdown()
+
+    def test_cancel_during_silent_wait_prevents_save(self) -> None:
+        """回归：预警之后的静默等待阶段也必须响应 cancel。
+
+        早期实现里 _interruptible_sleep 只检查插件卸载，导致静默等待期间的
+        cancel 既不生效也不回执，服务端照常重启。
+        """
+        manager = self._make_manager(6, 2)
+        source = FakeSource(player="Admin", console=False)
+        manager._command_run(source)
+
+        deadline = time.monotonic() + 5
+        phase = None
+        while time.monotonic() < deadline:
+            with manager._lock:
+                phase = manager._phase
+            if phase is Phase.SILENT_WAIT:
+                break
+            time.sleep(0.01)
+
+        self.assertIs(phase, Phase.SILENT_WAIT)
+        manager._command_cancel(source)
+        time.sleep(1.0)
+
+        self.assertEqual(self._save_commands(), [])
+        self.assertTrue(
+            any("已取消" in text for text in self._broadcasts())
+        )
+        self.assertTrue(
+            any("已取消本次操作" in reply for reply in source.replies)
         )
         manager.shutdown()
 
@@ -600,6 +637,25 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(any("打断" in reply for reply in source.replies))
         manager.shutdown()
 
+    def test_interrupt_clears_one_shot_delay_restart(self) -> None:
+        """回归：定时重启关闭时，interrupt 必须清掉 delay 产生的一次性重启。
+
+        早期实现只重排不清空，_next_restart_at 会被重新捡回来，等于没打断。
+        """
+        manager = self._make_manager()
+        source = FakeSource()
+
+        manager._command_delay(source, {"duration": "30m"})
+        with manager._lock:
+            self.assertIsNotNone(manager._next_restart_at)
+
+        manager._command_interrupt(source)
+
+        with manager._lock:
+            self.assertIsNone(manager._next_restart_at)
+        self.assertTrue(any("打断" in reply for reply in source.replies))
+        manager.shutdown()
+
     def test_interrupt_without_pending_restart_reports_none(self) -> None:
         manager = self._make_manager()
         source = FakeSource()
@@ -639,6 +695,202 @@ class ScheduleTests(unittest.TestCase):
             "时长写法",
         ):
             self.assertIn(keyword, joined)
+        manager.shutdown()
+
+
+class ScheduledFlowTests(unittest.TestCase):
+    """验证 restart / shutdown 带时长时的预约流程、折半播报与自动保存。"""
+
+    def setUp(self) -> None:
+        self.server = FakeServer()
+
+    def tearDown(self) -> None:
+        self.server.close()
+
+    def _make_manager(self, **overrides: object) -> AutoSaveManager:
+        raw = default_config_dict()
+        raw["保存间隔分钟"] = 60
+        raw["保存预警秒数"] = 5
+        raw["保存倒计时秒数"] = 5
+        raw.update(overrides)
+        config, _ = parse_config(raw)
+        manager = AutoSaveManager(self.server, config)
+        manager.start()
+        return manager
+
+    def _broadcasts(self) -> list[str]:
+        return [
+            command[len(SAY_PREFIX):]
+            for command in self.server.commands
+            if command.startswith(SAY_PREFIX)
+        ]
+
+    def _save_commands(self) -> list[str]:
+        return [
+            command
+            for command in self.server.commands
+            if not command.startswith(SAY_PREFIX)
+        ]
+
+    def _wait_for(self, predicate, timeout: float = 8.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_announce_points_halve_remaining(self) -> None:
+        points = AutoSaveManager._announce_points(1800, 60, 1000.0)
+
+        self.assertEqual([value for _at, value in points], [900, 450, 225, 112])
+        self.assertAlmostEqual(points[0][0], 100.0, delta=0.01)
+        self.assertAlmostEqual(points[-1][0], 887.5, delta=0.01)
+
+    def test_announce_points_stop_when_short(self) -> None:
+        # 剩余时间不足下限时不产生折半播报，交由正式流程接管。
+        self.assertEqual(AutoSaveManager._announce_points(90, 60, 1000.0), [])
+
+    def test_restart_with_duration_defers_stop(self) -> None:
+        manager = self._make_manager()
+        source = FakeSource()
+
+        manager._command_restart(source, {"duration": "30m"})
+        time.sleep(0.2)
+
+        self.assertEqual(self._save_commands(), [])
+        with manager._lock:
+            self.assertIs(manager._phase, Phase.SCHEDULED)
+            self.assertTrue(manager._flow_active)
+            self.assertIs(manager._flow_kind, FlowKind.RESTART)
+        self.assertTrue(any("已预约" in reply for reply in source.replies))
+        self.assertTrue(
+            any("30分钟" in text for text in self._broadcasts())
+        )
+        manager.shutdown()
+
+    def test_restart_without_duration_runs_immediately(self) -> None:
+        manager = self._make_manager(保存预警秒数=1, 保存倒计时秒数=1)
+        source = FakeSource()
+
+        manager._command_restart(source, {})
+
+        self.assertTrue(
+            self._wait_for(lambda: "stop" in self.server.commands, timeout=6)
+        )
+        self.assertEqual(self._save_commands(), ["save-all", "stop"])
+        manager.shutdown()
+
+    def test_invalid_duration_is_rejected(self) -> None:
+        manager = self._make_manager()
+        source = FakeSource()
+
+        manager._command_restart(source, {"duration": "abc"})
+        time.sleep(0.1)
+
+        self.assertTrue(
+            any("无法识别时长" in reply for reply in source.replies)
+        )
+        with manager._lock:
+            self.assertFalse(manager._flow_active)
+        self.assertEqual(self.server.commands, [])
+        manager.shutdown()
+
+    def test_short_duration_compresses_warning(self) -> None:
+        manager = self._make_manager(保存预警秒数=60, 保存倒计时秒数=10)
+        source = FakeSource()
+
+        started = time.monotonic()
+        manager._command_restart(source, {"duration": "2s"})
+
+        self.assertTrue(
+            self._wait_for(lambda: "stop" in self.server.commands, timeout=8)
+        )
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertTrue(
+            any("2 秒后重启" in text for text in self._broadcasts())
+        )
+        manager.shutdown()
+
+    def test_delayed_shutdown_disables_guard_before_stop(self) -> None:
+        manager = self._make_manager(保存预警秒数=1, 保存倒计时秒数=1)
+        source = FakeSource()
+
+        manager._command_shutdown(source, {"duration": "2s"})
+
+        self.assertTrue(
+            self._wait_for(
+                lambda: self.server.stop_exit_calls >= 1,
+                timeout=10,
+            )
+        )
+        with manager._lock:
+            self.assertFalse(manager._guard_enabled)
+        self.assertIs(self.server.exit_after_stop, True)
+        self.assertTrue(any("关服" in text for text in self._broadcasts()))
+        manager.shutdown()
+
+    def test_interrupt_cancels_scheduled_restart(self) -> None:
+        manager = self._make_manager()
+        source = FakeSource()
+
+        manager._command_restart(source, {"duration": "30m"})
+        time.sleep(0.1)
+        manager._command_interrupt(source)
+
+        self.assertTrue(
+            self._wait_for(lambda: not manager._flow_active, timeout=5)
+        )
+        self.assertEqual(self._save_commands(), [])
+        self.assertTrue(
+            any("本次重启已取消" in text for text in self._broadcasts())
+        )
+        manager.shutdown()
+
+    def test_scheduled_wait_keeps_saving(self) -> None:
+        manager = self._make_manager(保存预警秒数=1, 保存倒计时秒数=1)
+        source = FakeSource()
+
+        with mock.patch.object(
+            AutoSaveConfig,
+            "interval_seconds",
+            new_callable=mock.PropertyMock,
+            return_value=0.5,
+        ):
+            manager._command_restart(source, {"duration": "2s"})
+            self.assertTrue(
+                self._wait_for(
+                    lambda: "stop" in self.server.commands,
+                    timeout=8,
+                )
+            )
+
+        saves = [cmd for cmd in self._save_commands() if cmd == "save-all"]
+        self.assertGreaterEqual(len(saves), 2)
+        manager.shutdown()
+
+    def test_status_reports_scheduled_flow(self) -> None:
+        manager = self._make_manager()
+        source = FakeSource()
+
+        manager._command_restart(source, {"duration": "10m"})
+        manager._command_status(source)
+
+        joined = "\n".join(source.replies)
+        self.assertIn("已预约重启", joined)
+        self.assertIn("等待时间到达", joined)
+        manager.shutdown()
+
+    def test_help_documents_duration_forms(self) -> None:
+        manager = self._make_manager()
+        source = FakeSource()
+
+        manager._command_help(source)
+
+        joined = "\n".join(source.replies)
+        self.assertIn("restart <时长>", joined)
+        self.assertIn("shutdown <时长>", joined)
+        self.assertIn("预约播报", joined)
         manager.shutdown()
 
 

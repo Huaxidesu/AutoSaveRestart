@@ -56,6 +56,10 @@ RESTART_RETRY_INTERVAL_SECONDS = 5.0
 # 单次延后允许的最大时长，避免误输入把重启推到数月之后。
 MAX_DELAY_SECONDS = 30 * 24 * 3600
 
+# 预约流程折半播报的下限。剩余时间降到该值（且不低于预警时长）后停止重复播报，
+# 交由正式的预警与倒计时流程接管，避免临近停止时刻时播报过密。
+MIN_ANNOUNCE_REMAINING_SECONDS = 60
+
 # 1.7.10 仅支持 § 颜色码，不支持 RGB / hex，此表将 RColor 映射为对应的 § 码。
 # 以 RColor 的 name 作为键，兼容 RColor 不是 Enum 的 MCDR 版本。
 LEGACY_COLOR_CODES: Dict[str, str] = {
@@ -105,17 +109,27 @@ HELP_LINES: Tuple[str, ...] = (
     "",
     "【重启】",
     "{root} restart        立即执行一次重启流程：保存 → 倒计时 → 停止服务端 → 自动拉起",
+    "{root} restart <时长> 预约重启：先播报，等待期间按剩余时间折半提醒，到点后重启",
     "{root} interrupt      打断本次自动重启；若正在等待拉起，则取消本次拉起",
     "{root} delay <时长>    把下一次自动重启往后推，支持 30m、2h、90s、1h30m、1h30m15s",
     "{root} guard on       开启崩溃守护并清零崩溃计数",
     "{root} guard off      关闭崩溃守护，服务端停止后不再自动拉起",
     "{root} start          手动启动服务端进程，服务端已停止时使用",
-    "{root} shutdown       关闭崩溃守护并正常关服，之后不会自动拉起",
+    "{root} shutdown       关闭崩溃守护并立即关服，之后不会自动拉起",
+    "{root} shutdown <时长> 预约关服：先播报并按折半节奏提醒，到点后保存并关服",
+    "",
+    "【预约播报】",
+    "restart 与 shutdown 带上时长后不会立即执行，而是进入预约等待。",
+    "开始时播报一条发起提示，随后在剩余时间减半时各播报一次，",
+    "例如 30m 依次在剩余 30 分、15 分、7 分 30 秒、3 分 45 秒、1 分 52 秒时提醒。",
+    "剩余时间降到预警时长后转入正式流程：保存 → 倒计时 → 停止服务端。",
+    "预约期间仍按「保存间隔分钟」自动保存，避免长时间等待丢失进度。",
+    "预约等待可用 cancel 或 interrupt 取消。",
     "",
     "【时长写法】",
     "单位可用 h 或 小时、m 或 分钟、s 或 秒；单独使用或任意组合均可。",
     "只写数字时按分钟计算，例如 delay 30 等同于 delay 30m。",
-    "示例：delay 2h、delay 45m、delay 90s、delay 1h30m、delay 1小时30分、delay 1h30m15s。",
+    "示例：restart 2h、restart 45m、restart 1h30m、shutdown 30m、delay 90s。",
     "",
     "【自动重启规则】",
     "崩溃守护开启时，服务端进程退出（崩溃、控制台 stop、定时重启）后都会在「拉起延迟秒数」之后重新拉起。",
@@ -190,6 +204,7 @@ class Broadcast:
 
 class Phase(Enum):
     WAITING = "waiting"
+    SCHEDULED = "scheduled"
     WARNING = "warning"
     SILENT_WAIT = "silent_wait"
     COUNTDOWN = "countdown"
@@ -198,10 +213,11 @@ class Phase(Enum):
 
 
 class FlowKind(Enum):
-    """一次流程结束时的收尾动作：只保存，或保存后重启。"""
+    """一次流程结束时的收尾动作：只保存、保存后重启，或保存后关闭服务端。"""
 
     SAVE = "save"
     RESTART = "restart"
+    SHUTDOWN = "shutdown"
 
 
 class AutoSaveManager:
@@ -524,7 +540,11 @@ class AutoSaveManager:
         root.runs(self._command_status)
         root.then(Literal("help").runs(self._command_help))
         root.then(Literal("run").runs(self._command_run))
-        root.then(Literal("restart").runs(self._command_restart))
+        root.then(
+            Literal("restart")
+            .runs(self._command_restart)
+            .then(GreedyText("duration").runs(self._command_restart))
+        )
         root.then(Literal("cancel").runs(self._command_cancel))
         root.then(Literal("interrupt").runs(self._command_interrupt))
         root.then(
@@ -545,7 +565,11 @@ class AutoSaveManager:
             .then(Literal("off").runs(self._command_guard_off))
         )
         root.then(Literal("start").runs(self._command_start))
-        root.then(Literal("shutdown").runs(self._command_shutdown))
+        root.then(
+            Literal("shutdown")
+            .runs(self._command_shutdown)
+            .then(GreedyText("duration").runs(self._command_shutdown))
+        )
         return root
 
     def _has_permission(self, source: CommandSource) -> bool:
@@ -569,6 +593,7 @@ class AutoSaveManager:
         with self._lock:
             phase = self._phase
             flow_active = self._flow_active
+            flow_kind = self._flow_kind
             countdown_remaining = self._countdown_remaining
             next_auto_save_at = self._next_auto_save_at
             next_restart_at = self._next_restart_at
@@ -593,7 +618,25 @@ class AutoSaveManager:
             )
         )
 
-        if flow_active:
+        if flow_active and phase is Phase.SCHEDULED:
+            remaining = self._remaining_text(current_flow_save_at)
+            source.reply(
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.status_scheduled,
+                        action=self._flow_action_text(flow_kind),
+                        remaining=remaining,
+                    ),
+                    RColor.gold,
+                )
+            )
+            source.reply(
+                self._styled_text(
+                    self.config.messages.status_next_after_flow,
+                    RColor.gray,
+                )
+            )
+        elif flow_active:
             remaining = self._remaining_text(current_flow_save_at)
             source.reply(
                 self._styled_text(
@@ -719,13 +762,53 @@ class AutoSaveManager:
     def _command_run(self, source: CommandSource) -> None:
         self._start_manual_flow(source, FlowKind.SAVE)
 
-    def _command_restart(self, source: CommandSource) -> None:
-        self._start_manual_flow(source, FlowKind.RESTART)
+    def _command_restart(
+        self,
+        source: CommandSource,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        delay_seconds = self._resolve_delay_seconds(source, context)
+        if delay_seconds is None:
+            return
+        self._start_manual_flow(source, FlowKind.RESTART, delay_seconds)
+
+    def _resolve_delay_seconds(
+        self,
+        source: CommandSource,
+        context: Optional[Dict[str, Any]],
+    ) -> Optional[int]:
+        """
+        从指令上下文读取可选的时长参数。
+
+        返回 0 表示未提供时长，调用方按立即执行处理；返回 None 表示时长
+        写法非法，且已向执行者回复格式提示。
+        """
+        if not isinstance(context, dict):
+            return 0
+
+        text = context.get("duration")
+        if text is None:
+            return 0
+
+        seconds = parse_duration(text) if isinstance(text, str) else None
+        if seconds is None:
+            source.reply(
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.delay_invalid,
+                        text=str(text),
+                    ),
+                    RColor.red,
+                )
+            )
+            return None
+        return seconds
 
     def _start_manual_flow(
         self,
         source: CommandSource,
         kind: FlowKind,
+        delay_seconds: int = 0,
     ) -> None:
         if not self.server.is_server_running():
             message = (
@@ -754,30 +837,80 @@ class AutoSaveManager:
             self._flow_active = True
             self._flow_kind = kind
             self._restart_dispatched = False
-            self._phase = Phase.WARNING
             self._countdown_remaining = 0
             self._next_auto_save_at = None
-            self._current_flow_save_at = (
-                time.monotonic() + self.config.warning_seconds
-            )
             self._cancel_reason = None
             self._cancel_requested = False
 
-            future = self.server.schedule_task(
-                self._manual_cycle(generation, kind)
-            )
+            now = time.monotonic()
+            if delay_seconds > 0:
+                # 预约流程：等待期间保持流程占用状态，由折半播报协程推进。
+                self._phase = Phase.SCHEDULED
+                self._current_flow_save_at = now + delay_seconds
+                future = self.server.schedule_task(
+                    self._delayed_manual_cycle(
+                        generation,
+                        kind,
+                        delay_seconds,
+                        self._actor_name(source),
+                    )
+                )
+            else:
+                self._phase = Phase.WARNING
+                self._current_flow_save_at = (
+                    now + self.config.warning_seconds
+                )
+                future = self.server.schedule_task(
+                    self._manual_cycle(generation, kind)
+                )
             self._cycle_future = future
             future.add_done_callback(self._on_cycle_done)
 
         if old_future is not None:
             old_future.cancel()
 
-        started_message = (
-            self.config.messages.manual_started
-            if kind is FlowKind.SAVE
-            else self.config.messages.manual_restart_started
+        if delay_seconds > 0:
+            source.reply(
+                self._styled_text(
+                    self._format_message(
+                        self.config.messages.schedule_confirmed,
+                        action=self._flow_action_text(kind),
+                        remaining=self._format_duration(delay_seconds),
+                    ),
+                    RColor.green,
+                    bold=True,
+                )
+            )
+            return
+
+        source.reply(
+            self._styled_text(
+                self._manual_started_message(kind),
+                RColor.aqua,
+            )
         )
-        source.reply(self._styled_text(started_message, RColor.aqua))
+
+    def _manual_started_message(self, kind: FlowKind) -> str:
+        messages = self.config.messages
+        if kind is FlowKind.SAVE:
+            return messages.manual_started
+        if kind is FlowKind.SHUTDOWN:
+            return messages.manual_shutdown_started
+        return messages.manual_restart_started
+
+    @staticmethod
+    def _flow_action_text(kind: FlowKind) -> str:
+        """播报中使用的动作名，用于拼接「发起重启」「距离关服还有」这类文案。"""
+        return "关服" if kind is FlowKind.SHUTDOWN else "重启"
+
+    def _cancelled_template(self, kind: FlowKind) -> str:
+        """按流程类型选择取消播报文案，避免重启被取消时提示「保存已取消」。"""
+        messages = self.config.messages
+        if kind is FlowKind.SHUTDOWN:
+            return messages.shutdown_cancelled
+        if kind is FlowKind.RESTART:
+            return messages.restart_cancelled
+        return messages.cancelled
 
     def _command_cancel(self, source: CommandSource) -> None:
         actor = self._actor_name(source)
@@ -800,14 +933,14 @@ class AutoSaveManager:
             if self._shutdown:
                 return
 
-            if self._flow_active and self._flow_kind is FlowKind.RESTART:
+            if self._flow_active and self._flow_kind is not FlowKind.SAVE:
                 self._cancel_reason = reason
                 self._cancel_requested = True
                 future = self._cycle_future
                 acted = True
             elif (
                 not self._flow_active
-                and self._flow_kind is FlowKind.RESTART
+                and self._flow_kind is not FlowKind.SAVE
                 and self._cycle_future is not None
             ):
                 # 重启还停留在等待阶段，直接作废本次排期并顺延到下一个周期。
@@ -819,6 +952,10 @@ class AutoSaveManager:
                     self._next_restart_at = (
                         now + self.config.restart.interval_seconds
                     )
+                else:
+                    # 定时重启未启用时，_next_restart_at 是 delay 产生的一次性预约，
+                    # 打断就该清空；否则下面的重排会立刻把它捡回来，等于没打断。
+                    self._next_restart_at = None
                 if self._next_auto_save_at is None:
                     self._next_auto_save_at = (
                         now + self.config.interval_seconds
@@ -862,11 +999,11 @@ class AutoSaveManager:
         reason: Optional[str],
     ) -> None:
         with self._lock:
-            if (
-                self._shutdown
-                or not self._flow_active
-                or self._cycle_future is None
-            ):
+            if self._shutdown:
+                return
+
+            future = self._cycle_future
+            if future is None or future.done():
                 source.reply(
                     self._styled_text(
                         self.config.messages.cancel_not_available,
@@ -875,25 +1012,21 @@ class AutoSaveManager:
                 )
                 return
 
+            # 预约等待阶段的 _flow_active 仍为 False，因此这里只认 future 是否存在，
+            # 否则在等待期执行 cancel 会被误判成「没有可取消的流程」。
             self._cancel_reason = reason
             self._cancel_requested = True
-            generation = self._generation
-            future = self._cycle_future
 
-        if not future.cancel():
-            with self._lock:
-                if (
-                    generation == self._generation
-                    and self._cycle_future is future
-                ):
-                    self._cancel_requested = False
-                    self._cancel_reason = None
-            source.reply(
-                self._styled_text(
-                    self.config.messages.cancel_not_available,
-                    RColor.yellow,
-                )
+        # 协程尚未开始时可以整体取消；已经在跑的话靠上面的标志在下一个检查点退出。
+        # 不能因为 cancel() 返回 False 就回滚标志，那样运行中的流程会继续走完。
+        future.cancel()
+
+        source.reply(
+            self._styled_text(
+                self.config.messages.cancel_confirmed,
+                RColor.yellow,
             )
+        )
 
     def _command_delay(
         self,
@@ -927,7 +1060,7 @@ class AutoSaveManager:
                 self._next_restart_at += seconds
             remaining = self._next_restart_at - now
 
-            if self._flow_active and self._flow_kind is FlowKind.RESTART:
+            if self._flow_active and self._flow_kind is not FlowKind.SAVE:
                 # 流程已开始，静默取消当前流程，由流程收尾按新的重启时间重排。
                 self._cancel_requested = True
                 self._cancel_reason = None
@@ -1078,7 +1211,24 @@ class AutoSaveManager:
                 )
             )
 
-    def _command_shutdown(self, source: CommandSource) -> None:
+    def _command_shutdown(
+        self,
+        source: CommandSource,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        delay_seconds = self._resolve_delay_seconds(source, context)
+        if delay_seconds is None:
+            return
+        if delay_seconds > 0:
+            # 预约关服：等待期间保持守护开启，到点由流程关闭守护并停服，
+            # 这样中途取消仍可正常继续运行。
+            self._start_manual_flow(
+                source,
+                FlowKind.SHUTDOWN,
+                delay_seconds,
+            )
+            return
+
         with self._lock:
             if self._shutdown:
                 return
@@ -1174,6 +1324,7 @@ class AutoSaveManager:
         try:
             if prewarning_delay > 0 and not await self._interruptible_sleep(
                 prewarning_delay,
+                generation,
             ):
                 return
         except asyncio.CancelledError:
@@ -1203,12 +1354,237 @@ class AutoSaveManager:
     ) -> None:
         await self._run_save_flow(generation, kind)
 
+    async def _delayed_manual_cycle(
+        self,
+        generation: int,
+        kind: FlowKind,
+        delay_seconds: int,
+        actor: str,
+    ) -> None:
+        """
+        预约流程：先播报发起提示，按剩余时间折半提醒，到点转入正式流程。
+
+        折半提醒在剩余时间降到预警时长（且不低于 MIN_ANNOUNCE_REMAINING_SECONDS）
+        时停止，剩余区间交给正式流程的预警与逐秒倒计时，避免临近停止时播报过密。
+        """
+        delegated = False
+        try:
+            if not await self._run_delayed_phase(
+                generation,
+                kind,
+                delay_seconds,
+                actor,
+            ):
+                await self._announce_cancellation_if_needed(generation)
+                return
+
+            config_snapshot = self.config
+            warning_seconds = min(
+                config_snapshot.warning_seconds,
+                delay_seconds,
+            )
+            countdown_seconds = min(
+                config_snapshot.countdown_seconds,
+                warning_seconds,
+            )
+            self._enter_flow_phase(generation, warning_seconds)
+            # 转交 _run_save_flow 之后，收尾由它负责，避免重复排期。
+            delegated = True
+            await self._run_save_flow(
+                generation,
+                kind,
+                warning_seconds=warning_seconds,
+                countdown_seconds=countdown_seconds,
+            )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if not delegated:
+                # 取消可能是「协程被整体取消」也可能是「检查点提前 return」，
+                # 两条路径都要在这里播报，否则玩家看不到流程已被取消。
+                try:
+                    await self._announce_cancellation_if_needed(generation)
+                finally:
+                    self._finish_flow(generation, kind)
+
+    async def _run_delayed_phase(
+        self,
+        generation: int,
+        kind: FlowKind,
+        delay_seconds: int,
+        actor: str,
+    ) -> bool:
+        """
+        推进预约等待阶段，返回 False 表示流程被取消或插件正在卸载。
+
+        等待期间维持自动保存节奏：长时预约（如 2 小时）不会因为流程占用
+        而停止保存，避免崩溃时丢失这段时间的进度。
+        """
+        config_snapshot = self.config
+        action = self._flow_action_text(kind)
+        started_at = time.monotonic()
+        deadline = started_at + delay_seconds
+        warning_seconds = min(
+            config_snapshot.warning_seconds,
+            delay_seconds,
+        )
+        flow_start_at = deadline - warning_seconds
+        announce_points = self._announce_points(
+            delay_seconds,
+            max(MIN_ANNOUNCE_REMAINING_SECONDS, warning_seconds),
+            deadline,
+        )
+        next_save_at = started_at + config_snapshot.interval_seconds
+
+        if not await self._broadcast_async(
+            Broadcast(
+                self._format_message(
+                    config_snapshot.messages.schedule_announce,
+                    action=action,
+                    actor=actor,
+                    remaining=self._format_duration(delay_seconds),
+                ),
+                RColor.gold,
+                bold=True,
+            ),
+            generation,
+        ):
+            return False
+
+        while True:
+            with self._lock:
+                if self._shutdown or self._cancel_requested:
+                    return False
+                if not self._is_generation_valid_locked(generation):
+                    return False
+
+            now = time.monotonic()
+            candidates = []
+            if announce_points:
+                candidates.append(announce_points[0][0])
+            if next_save_at < flow_start_at:
+                candidates.append(next_save_at)
+            if not candidates:
+                break
+
+            wake_at = min(candidates)
+            if wake_at > now:
+                if not await self._delayed_wait(wake_at - now, generation):
+                    return False
+                now = time.monotonic()
+
+            if announce_points and now >= announce_points[0][0] - 0.5:
+                _due_at, remaining_seconds = announce_points.pop(0)
+                if not await self._broadcast_async(
+                    Broadcast(
+                        self._format_message(
+                            config_snapshot.messages.schedule_tick,
+                            action=action,
+                            remaining=self._format_duration(
+                                remaining_seconds
+                            ),
+                        ),
+                        RColor.yellow,
+                    ),
+                    generation,
+                ):
+                    return False
+                continue
+
+            if now >= next_save_at:
+                next_save_at = now + config_snapshot.interval_seconds
+                if not await self._execute_periodic_save(
+                    config_snapshot,
+                    generation,
+                ):
+                    return False
+
+        remaining_wait = flow_start_at - time.monotonic()
+        if remaining_wait > 0:
+            return await self._delayed_wait(remaining_wait, generation)
+        return True
+
+    @staticmethod
+    def _announce_points(
+        delay_seconds: int,
+        floor_seconds: int,
+        deadline: float,
+    ) -> "list[Tuple[float, int]]":
+        """
+        计算折半播报的触发时刻与对应的剩余秒数。
+
+        以剩余时间连续减半生成：30 分钟依次为 15 分、7 分 30 秒、3 分 45 秒……
+        剩余时间降到下限后停止，由正式流程接管。
+        """
+        points = []
+        remaining = float(delay_seconds)
+        while True:
+            next_remaining = remaining / 2.0
+            if next_remaining <= floor_seconds:
+                break
+            remaining = next_remaining
+            points.append((deadline - remaining, int(remaining)))
+        return points
+
+    async def _delayed_wait(self, seconds: float, generation: int) -> bool:
+        """
+        预约等待期间的分段睡眠，逐段检查取消请求与插件卸载状态。
+
+        与 _interruptible_sleep 的区别在于同时响应 interrupt 与 cancel，
+        使长达数小时的预约可以被立即打断。
+        """
+        remaining = float(seconds)
+        while remaining > 0:
+            with self._lock:
+                if self._shutdown or self._cancel_requested:
+                    return False
+                if not self._is_generation_valid_locked(generation):
+                    return False
+            step = min(SHUTDOWN_POLL_INTERVAL_SECONDS, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
+
+        with self._lock:
+            return self._is_action_allowed_locked(generation)
+
+    async def _execute_periodic_save(
+        self,
+        config_snapshot: AutoSaveConfig,
+        generation: int,
+    ) -> bool:
+        """预约等待期间的自动保存：只播报提示并保存，不进入倒计时流程。"""
+        if not await self._broadcast_async(
+            Broadcast(config_snapshot.messages.saving, RColor.aqua),
+            generation,
+        ):
+            return False
+        return await self._execute_save_async(
+            config_snapshot.save_command,
+            generation,
+        )
+
+    def _enter_flow_phase(self, generation: int, warning_seconds: int) -> None:
+        with self._lock:
+            if not self._is_action_allowed_locked(generation):
+                return
+            self._phase = Phase.WARNING
+            self._current_flow_save_at = (
+                time.monotonic() + warning_seconds
+            )
+
     def _flow_templates(
         self,
         config_snapshot: AutoSaveConfig,
         kind: FlowKind,
     ) -> Tuple[str, str, str, str]:
         messages = config_snapshot.messages
+        if kind is FlowKind.SHUTDOWN:
+            return (
+                messages.shutdown_warning,
+                messages.shutdown_countdown,
+                messages.shutting_down,
+                messages.shutdown_dispatched,
+            )
         if kind is FlowKind.RESTART:
             return (
                 messages.restart_warning,
@@ -1227,7 +1603,16 @@ class AutoSaveManager:
         self,
         generation: int,
         kind: FlowKind,
+        *,
+        warning_seconds: Optional[int] = None,
+        countdown_seconds: Optional[int] = None,
     ) -> None:
+        """
+        执行「预警 → 静默等待 → 逐秒倒计时 → 保存 → 收尾」流程。
+
+        warning_seconds / countdown_seconds 用于预约流程：预约时长短于默认
+        预警时长时，按实际时长缩短预警与倒计时，避免停止时刻被拖后。
+        """
         try:
             if not await self._server_running_async(generation):
                 self.server.logger.info(
@@ -1236,15 +1621,28 @@ class AutoSaveManager:
                 return
 
             config_snapshot = self.config
+            warning = (
+                config_snapshot.warning_seconds
+                if warning_seconds is None
+                else warning_seconds
+            )
+            countdown = (
+                config_snapshot.countdown_seconds
+                if countdown_seconds is None
+                else countdown_seconds
+            )
+            countdown = min(countdown, warning)
+            silent_wait = warning - countdown
+
             warning_template, countdown_template, busy_template, done_template = (
                 self._flow_templates(config_snapshot, kind)
             )
 
-            if config_snapshot.warning_seconds > 0:
+            if warning > 0:
                 self._set_phase(generation, Phase.WARNING)
                 warning_message = self._format_message(
                     warning_template,
-                    seconds=config_snapshot.warning_seconds,
+                    seconds=warning,
                 )
                 if not await self._broadcast_async(
                     Broadcast(warning_message, RColor.gold),
@@ -1252,14 +1650,16 @@ class AutoSaveManager:
                 ):
                     return
 
-            silent_wait = config_snapshot.silent_wait_seconds
             if silent_wait > 0:
                 self._set_phase(generation, Phase.SILENT_WAIT)
-                if not await self._interruptible_sleep(silent_wait):
+                if not await self._interruptible_sleep(
+                    silent_wait,
+                    generation,
+                ):
                     return
 
             for seconds in range(
-                config_snapshot.countdown_seconds,
+                countdown,
                 0,
                 -1,
             ):
@@ -1303,7 +1703,7 @@ class AutoSaveManager:
             ):
                 return
 
-            if kind is FlowKind.RESTART:
+            if kind is not FlowKind.SAVE:
                 await self._dispatch_restart_async(generation)
                 return
 
@@ -1316,9 +1716,14 @@ class AutoSaveManager:
                 generation,
             )
         except asyncio.CancelledError:
-            await self._announce_cancellation_if_needed(generation)
+            pass
         finally:
-            self._finish_flow(generation, kind)
+            # 取消可能是「协程被整体取消」也可能是「检查点提前 return」，
+            # 两条路径都要在这里播报，否则玩家看不到流程已被取消。
+            try:
+                await self._announce_cancellation_if_needed(generation)
+            finally:
+                self._finish_flow(generation, kind)
 
     async def _dispatch_restart_async(self, generation: int) -> bool:
         return await self._run_on_executor(
@@ -1329,10 +1734,19 @@ class AutoSaveManager:
         with self._lock:
             if not self._is_action_allowed_locked(generation):
                 return False
+            kind = self._flow_kind
         if not self.server.is_server_running():
             return False
 
         self._restart_dispatched = True
+        if kind is FlowKind.SHUTDOWN:
+            # 关服前先关闭守护，否则服务端退出会被 on_server_stop 重新拉起。
+            with self._lock:
+                self._guard_enabled = False
+            self._apply_exit_flag()
+            self.server.stop_exit()
+            return True
+
         command = self._sanitize_text(self.config.restart.stop_command)
         if self._guard_enabled:
             # 守护开启时只停止服务端，由 on_server_stop 触发重新拉起。
@@ -1350,13 +1764,14 @@ class AutoSaveManager:
             if self._shutdown or generation != self._generation:
                 return
             reason = self._cancel_reason
+            kind = self._flow_kind
 
         if reason is None:
             return
 
         message = Broadcast(
             self._format_message(
-                self.config.messages.cancelled,
+                self._cancelled_template(kind),
                 reason=reason,
             ),
             RColor.red,
@@ -1437,21 +1852,30 @@ class AutoSaveManager:
             and not self._cancel_requested
         )
 
-    async def _interruptible_sleep(self, seconds: float) -> bool:
+    async def _interruptible_sleep(
+        self,
+        seconds: float,
+        generation: int,
+    ) -> bool:
         """
-        分段睡眠，每段结束时检查插件是否已进入卸载流程。
+        分段睡眠，逐段检查取消请求与插件卸载状态。
 
-        返回 False 表示因 shutdown 提前结束，调用方应直接返回，
-        避免挂起的协程拖住 MCDR 的 AsyncTaskExecutor 排空流程。
+        返回 False 表示流程应提前结束：插件正在卸载，或本轮已被 cancel / interrupt。
+        取消检查必须放在这里，否则流程在「预警后的静默等待」阶段收不到取消指令，
+        会出现 cancel 之后仍然照常重启的问题。
         """
         remaining = float(seconds)
         while remaining > 0:
-            if self._shutdown:
-                return False
+            with self._lock:
+                if self._shutdown:
+                    return False
+                if not self._is_action_allowed_locked(generation):
+                    return False
             step = min(SHUTDOWN_POLL_INTERVAL_SECONDS, remaining)
             await asyncio.sleep(step)
             remaining -= step
-        return not self._shutdown
+        with self._lock:
+            return self._is_action_allowed_locked(generation)
 
     async def _server_running_async(self, generation: int) -> bool:
         return await self._run_on_executor(
@@ -1630,6 +2054,7 @@ class AutoSaveManager:
         messages = self.config.messages
         mapping = {
             Phase.WAITING: messages.phase_waiting,
+            Phase.SCHEDULED: messages.phase_scheduled,
             Phase.WARNING: messages.phase_warning,
             Phase.SILENT_WAIT: messages.phase_silent_wait,
             Phase.COUNTDOWN: messages.phase_countdown,
