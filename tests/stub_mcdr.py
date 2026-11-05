@@ -35,6 +35,10 @@ class DummyInteger(DummyNode):
     pass
 
 
+class DummyGreedyText(DummyNode):
+    pass
+
+
 class DummyLiteral(DummyNode):
     pass
 
@@ -90,6 +94,7 @@ def install_mcdr_stub() -> None:
     api_module = types.ModuleType("mcdreforged.api")
     all_module = types.ModuleType("mcdreforged.api.all")
     all_module.CommandSource = DummyCommandSource
+    all_module.GreedyText = DummyGreedyText
     all_module.Integer = DummyInteger
     all_module.Literal = DummyLiteral
     all_module.PluginServerInterface = DummyPluginServerInterface
@@ -115,6 +120,12 @@ class FakeServer:
         self.raw_messages: List[Any] = []
         self.commands: List[str] = []
         self.saved_configs: List[dict[str, Any]] = []
+        self.exit_after_stop: Optional[bool] = None
+        self.stored_config: Optional[dict[str, Any]] = None
+        self.start_calls: int = 0
+        self.start_result: bool = True
+        self.stop_exit_calls: int = 0
+        self.exit_calls: int = 0
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -134,6 +145,25 @@ class FakeServer:
 
     def is_server_running(self) -> bool:
         return self.running
+
+    def set_exit_after_stop_flag(self, flag_value: bool) -> None:
+        self.exit_after_stop = flag_value
+
+    def start(self) -> bool:
+        self.start_calls += 1
+        if not self.start_result:
+            return False
+        self.running = True
+        return True
+
+    def stop_exit(self) -> bool:
+        self.stop_exit_calls += 1
+        self.running = False
+        return True
+
+    def exit(self) -> bool:
+        self.exit_calls += 1
+        return True
 
     def say(self, message: Any) -> None:
         self.raw_messages.append(message)
@@ -160,6 +190,17 @@ class FakeServer:
     ) -> None:
         del file_name
         self.saved_configs.append(config)
+
+    def load_config_simple(
+        self,
+        file_name: str,
+        default_config: dict[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del file_name, kwargs
+        if self.stored_config is not None:
+            return dict(self.stored_config)
+        return dict(default_config)
 
     async def _drain_loop(self) -> None:
         await asyncio.sleep(0)
