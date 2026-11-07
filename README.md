@@ -357,6 +357,15 @@ config/autosave/config.json
 
 ## 更新记录
 
+### 1.3.4
+
+- 修复：执行 `restart` / `cancel` / `interrupt` / `delay`，或服务端退出、修改保存间隔时，
+  控制台会打印一段 `InvalidStateError: CANCELLED` 与 `Exception in callback ...` 的堆栈。
+  原因是插件取消了 `schedule_task` 返回的 future：MCDR 的取消不会传导到 asyncio 协程，
+  协程随后正常结束时 `future_utils.copy_done_state` 又对已取消的 future 调用 `set_result`。
+  现在不再取消周期协程，退出改由 generation 与取消标志驱动，最长延迟一个轮询间隔（1 秒）。
+- 该堆栈只影响日志可读性，不影响保存与重启行为。
+
 ### 1.3.3
 
 - 取消回执改为「【自动保存】已取消本次操作。」，不再拼接原因，

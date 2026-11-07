@@ -41,6 +41,13 @@ MessagePayload = Union[str, RTextBase]
 # 分段睡眠并在每段结束时检查卸载状态。
 SHUTDOWN_POLL_INTERVAL_SECONDS = 1.0
 
+# 上述「取消不传导」还带来一个副作用：MCDR 在 future_utils.copy_done_state 中
+# 无条件对 TaskDoneFuture 调用 set_result / set_exception，只要该 future 已被取消，
+# 协程正常结束时就会抛出 InvalidStateError: CANCELLED，并被 asyncio 记为
+# 「Exception in callback ...」打印到控制台。由于取消既不能停止协程，又只会产生
+# 这条异常，本插件一律不取消 schedule_task 返回的 future：流程的退出完全依赖
+# generation 与取消标志，最长延迟一个 SHUTDOWN_POLL_INTERVAL_SECONDS。
+
 # 桥接同步任务执行器的等待上限，防止 MCDR 停机竞态下 future 永不完成。
 EXECUTOR_WAIT_TIMEOUT_SECONDS = 15.0
 
@@ -298,7 +305,6 @@ class AutoSaveManager:
 
             self._shutdown = True
             self._generation += 1
-            cycle_future = self._cycle_future
             self._cycle_future = None
             executor_futures = tuple(self._executor_futures)
             self._executor_futures.clear()
@@ -313,15 +319,16 @@ class AutoSaveManager:
             self._restart_thread = None
             self._restart_cancel.set()
 
-        if cycle_future is not None:
-            cycle_future.cancel()
+        # 周期协程不取消：取消不会停止协程，反而会让它在正常结束时触发
+        # InvalidStateError，协程自身会在一个轮询间隔内检测到卸载标志后退出。
+        # 同步执行器任务必须取消，否则等待它们的协程要等到超时才结束。
         for future in executor_futures:
             future.cancel()
         if restart_thread is not None:
             restart_thread.join(timeout=2)
 
         self.server.logger.info(
-            "AutoSaveRestart unloaded; all scheduled tasks cancelled"
+            "AutoSaveRestart unloaded; pending coroutines will exit shortly"
         )
 
     def _apply_exit_flag(self) -> None:
@@ -831,7 +838,7 @@ class AutoSaveManager:
                 )
                 return
 
-            old_future = self._cycle_future
+            # 递增 generation 即可让原周期协程在下一个检查点退出，无需取消 future。
             self._generation += 1
             generation = self._generation
             self._flow_active = True
@@ -865,9 +872,6 @@ class AutoSaveManager:
                 )
             self._cycle_future = future
             future.add_done_callback(self._on_cycle_done)
-
-        if old_future is not None:
-            old_future.cancel()
 
         if delay_seconds > 0:
             source.reply(
@@ -927,7 +931,6 @@ class AutoSaveManager:
             actor=actor,
         )
 
-        future: Optional[Future[Any]] = None
         acted = False
         with self._lock:
             if self._shutdown:
@@ -936,7 +939,6 @@ class AutoSaveManager:
             if self._flow_active and self._flow_kind is not FlowKind.SAVE:
                 self._cancel_reason = reason
                 self._cancel_requested = True
-                future = self._cycle_future
                 acted = True
             elif (
                 not self._flow_active
@@ -945,7 +947,6 @@ class AutoSaveManager:
             ):
                 # 重启还停留在等待阶段，直接作废本次排期并顺延到下一个周期。
                 self._generation += 1
-                future = self._cycle_future
                 self._cycle_future = None
                 now = time.monotonic()
                 if self.config.restart.timed_restart_enabled:
@@ -969,9 +970,6 @@ class AutoSaveManager:
             ):
                 self._restart_cancel.set()
                 acted = True
-
-        if future is not None:
-            future.cancel()
 
         if not acted:
             source.reply(
@@ -1017,9 +1015,8 @@ class AutoSaveManager:
             self._cancel_reason = reason
             self._cancel_requested = True
 
-        # 协程尚未开始时可以整体取消；已经在跑的话靠上面的标志在下一个检查点退出。
-        # 不能因为 cancel() 返回 False 就回滚标志，那样运行中的流程会继续走完。
-        future.cancel()
+        # 不取消 future：取消无法停止协程，只会在协程正常结束时让 MCDR 抛出
+        # InvalidStateError。协程会在一个轮询间隔内看到取消标志并收尾。
 
         source.reply(
             self._styled_text(
@@ -1047,7 +1044,6 @@ class AutoSaveManager:
             )
             return
 
-        future: Optional[Future[Any]] = None
         with self._lock:
             if self._shutdown:
                 return
@@ -1064,12 +1060,8 @@ class AutoSaveManager:
                 # 流程已开始，静默取消当前流程，由流程收尾按新的重启时间重排。
                 self._cancel_requested = True
                 self._cancel_reason = None
-                future = self._cycle_future
             elif not self._flow_active:
                 self._schedule_auto_cycle_locked()
-
-        if future is not None:
-            future.cancel()
 
         source.reply(
             self._styled_text(
@@ -1254,11 +1246,9 @@ class AutoSaveManager:
     # ------------------------------------------------------------------
 
     def _reset_auto_cycle_locked(self) -> None:
-        old_future = self._cycle_future
+        # 递增 generation 后原周期协程会在下一个检查点退出，无需取消其 future。
         self._generation += 1
         self._cycle_future = None
-        if old_future is not None:
-            old_future.cancel()
         self._next_auto_save_at = time.monotonic() + self.config.interval_seconds
         self._schedule_auto_cycle_locked(increment_generation=False)
 
@@ -1785,7 +1775,6 @@ class AutoSaveManager:
     def _abort_flow_locked(self) -> None:
         """服务端退出时作废当前流程与排期，不播报取消提示。"""
         self._generation += 1
-        future = self._cycle_future
         self._cycle_future = None
         self._flow_active = False
         self._countdown_remaining = 0
@@ -1793,8 +1782,6 @@ class AutoSaveManager:
         self._cancel_reason = None
         self._cancel_requested = False
         self._restart_dispatched = False
-        if future is not None:
-            future.cancel()
 
     def _finish_flow(self, generation: int, kind: FlowKind) -> None:
         with self._lock:

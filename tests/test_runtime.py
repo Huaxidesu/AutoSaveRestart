@@ -148,7 +148,14 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertIs(phase, Phase.COUNTDOWN)
         manager._command_cancel(source)
-        time.sleep(0.3)
+
+        # 真实 MCDR 的 TaskDoneFuture.cancel() 不会中断协程，流程要等到下一个
+        # 检查点（倒计时每秒一次）才收尾，因此这里按轮询等待，而非假定立即生效。
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if any("已取消" in text for text in self._broadcasts()):
+                break
+            time.sleep(0.02)
 
         self.assertEqual(self._save_commands(), [])
         self.assertTrue(
